@@ -1,0 +1,242 @@
+// server.js — PostgreSQL Monitoring API
+// Dependencies: npm install express pg dotenv cors
+
+require('dotenv').config();
+const express = require('express');
+const { Pool } = require('pg');
+const cors = require('cors');
+const path = require('path');
+
+const app = express();
+const PORT = process.env.PORT || 8080;
+const API_KEY = process.env.API_KEY || 'change-me-please';
+
+app.use(express.static(path.join(__dirname, 'static')));
+
+// ─── DB Connection Pool ───────────────────────────────────────────────────────
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // e.g. DATABASE_URL=postgresql://user:password@host:5432/dbname
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
+app.use(cors());
+app.use(express.json());
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views/index.html'));
+});
+
+// Simple API key auth — checks X-API-Key header on all /api routes
+app.use('/api', (req, res, next) => {
+  const key = req.headers['x-api-key'];
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ success: false, error: 'Unauthorised' });
+  }
+  next();
+});
+
+// ─── 1. DB Connection Status ─────────────────────────────────────────────────
+
+app.get('/api/status', async (req, res) => {
+  const start = Date.now();
+  try {
+    await pool.query('SELECT 1');
+    res.json({
+      success: true,
+      data: {
+        connected: true,
+        latencyMs: Date.now() - start,
+        poolTotal: pool.totalCount,
+        poolIdle: pool.idleCount,
+        poolWaiting: pool.waitingCount,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      data: { connected: false },
+      error: err.message,
+    });
+  }
+});
+
+// ─── 2. Database Size ─────────────────────────────────────────────────────────
+
+app.get('/api/stats/db-size', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        pg_database.datname                            AS database,
+        pg_size_pretty(pg_database_size(pg_database.datname)) AS pretty_size,
+        pg_database_size(pg_database.datname)          AS size_bytes
+      FROM pg_database
+      WHERE datname = current_database()
+    `);
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── 3. Table Row Counts ──────────────────────────────────────────────────────
+
+app.get('/api/stats/row-counts', async (req, res) => {
+  // Use pg_class estimates for speed; accurate enough for monitoring.
+  // Switch to COUNT(*) per table if you need exact numbers (slower).
+  try {
+    const result = await pool.query(`
+      SELECT
+        pn.nspname                    AS dataset_name,
+        pc.relname                    AS table_name,
+        pc.reltuples::bigint          AS estimated_rows,
+        pg_size_pretty(pg_total_relation_size(pc.oid)) AS total_size
+      FROM pg_class pc
+      LEFT OUTER JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+      WHERE relkind = 'r'
+        AND pn.nspname in ('staging', 'bronze', 'silver', 'gold', 'elementary')
+      ORDER BY reltuples DESC
+    `);
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── 4. Slow Queries ──────────────────────────────────────────────────────────
+// Requires pg_stat_statements extension:
+//   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+app.get('/api/stats/slow-queries', async (req, res) => {
+  const limit = parseInt(req.query.limit) || 10;
+  try {
+    // Check extension is available first
+    const extCheck = await pool.query(`
+      SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
+    `);
+    if (extCheck.rowCount === 0) {
+      return res.status(503).json({
+        success: false,
+        error: 'pg_stat_statements extension is not installed. Run: CREATE EXTENSION pg_stat_statements;',
+      });
+    }
+
+    const result = await pool.query(`
+      SELECT
+        LEFT(query, 120)              AS query_preview,
+        calls,
+        round(mean_exec_time::numeric, 2)  AS avg_ms,
+        round(total_exec_time::numeric, 2) AS total_ms,
+        round(stddev_exec_time::numeric, 2) AS stddev_ms,
+        rows
+      FROM pg_stat_statements
+      WHERE query NOT LIKE '%pg_stat_statements%'
+      ORDER BY mean_exec_time DESC
+      LIMIT $1
+    `, [limit]);
+
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── 5. Pipeline / Custom Metrics ────────────────────────────────────────────
+// Adapt the queries below to match your pipeline's actual tables/columns.
+
+app.get('/api/pipeline', async (req, res) => {
+  try {
+    const [jobsResult, recentResult, failedResult] = await Promise.all([
+
+      // Total jobs by status — adjust table/column names to match yours
+      pool.query(`
+        SELECT status, COUNT(*) AS count
+        FROM pipeline_jobs
+        GROUP BY status
+      `),
+
+      // Last 5 completed jobs
+      pool.query(`
+        SELECT id, name, status, completed_at,
+               extract(epoch FROM (completed_at - started_at))::int AS duration_sec
+        FROM pipeline_jobs
+        WHERE status = 'completed'
+        ORDER BY completed_at DESC
+        LIMIT 5
+      `),
+
+      // Any jobs that failed in the last 24 hours
+      pool.query(`
+        SELECT id, name, error_message, failed_at
+        FROM pipeline_jobs
+        WHERE status = 'failed'
+          AND failed_at > NOW() - INTERVAL '24 hours'
+        ORDER BY failed_at DESC
+      `),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        summary: jobsResult.rows,         // e.g. [{status:'running', count:3}, ...]
+        recentCompleted: recentResult.rows,
+        recentFailed: failedResult.rows,
+      },
+    });
+  } catch (err) {
+    // Return a partial failure so the dashboard still renders other cards
+    res.status(500).json({
+      success: false,
+      error: `Pipeline query failed: ${err.message} — check your table names in server.js`,
+    });
+  }
+});
+
+// ─── 6. All Stats in One Shot ─────────────────────────────────────────────────
+// Handy for the dashboard's single "Refresh" button
+
+app.get('/api/all', async (req, res) => {
+  const results = await Promise.allSettled([
+    pool.query('SELECT 1'),                        // connection ping
+    pool.query(`                                   
+      SELECT pg_size_pretty(pg_database_size(current_database())) AS pretty_size,
+             pg_database_size(current_database()) AS size_bytes
+    `),
+    pool.query(`
+      SELECT relname AS table_name, reltuples::bigint AS estimated_rows,
+             pg_size_pretty(pg_total_relation_size(oid)) AS total_size
+      FROM pg_class
+      WHERE relkind = 'r'
+        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+      ORDER BY reltuples DESC
+    `),
+  ]);
+
+  const [ping, dbSize, rowCounts] = results;
+
+  res.json({
+    success: true,
+    data: {
+      connected:  ping.status === 'fulfilled',
+      dbSize:     dbSize.status === 'fulfilled'    ? dbSize.value.rows[0]    : null,
+      rowCounts:  rowCounts.status === 'fulfilled' ? rowCounts.value.rows    : [],
+      fetchedAt:  new Date().toISOString(),
+    },
+  });
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+pool.connect((err) => {
+  if (err) {
+    console.error('❌  Failed to connect to PostgreSQL:', err.message);
+    process.exit(1);
+  }
+  console.log('✅  Connected to PostgreSQL');
+  app.listen(PORT, () => console.log(`🚀  API running on http://localhost:${PORT}`));
+});

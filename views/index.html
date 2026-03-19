@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<title>DB Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Berkeley+Mono:ital@0;1&family=DM+Sans:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<script src="main.js" defer></script>
+</head>
+<body>
+ 
+<header>
+  <div class="header-left">
+    <div class="logo">
+      <svg viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <ellipse cx="7" cy="4" rx="5" ry="2.2" stroke="#4f8ef7" stroke-width="1.2"/>
+        <path d="M2 4v3c0 1.2 2.2 2.2 5 2.2s5-1 5-2.2V4" stroke="#4f8ef7" stroke-width="1.2"/>
+        <path d="M2 7v3c0 1.2 2.2 2.2 5 2.2s5-1 5-2.2V7" stroke="#4f8ef7" stroke-width="1.2"/>
+      </svg>
+    </div>
+    <h1>DB Monitor</h1>
+    <span class="db-label" id="db-host">localhost</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <button id="config-btn" title="Settings">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.05 3.05l1.42 1.42M11.53 11.53l1.42 1.42M3.05 12.95l1.42-1.42M11.53 4.47l1.42-1.42" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+    </button>
+    <button id="refresh-btn">
+      <svg viewBox="0 0 13 13" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M11.5 2A6 6 0 1 0 12 6.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        <path d="M9 2h2.5V4.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Refresh
+    </button>
+  </div>
+</header>
+ 
+<div class="main">
+  <div id="fetched-at" class="fetched-at" style="display:none;"></div>
+ 
+  <!-- Status -->
+  <div>
+    <div class="section-label">Connection</div>
+    <div class="status-card" id="status-card">
+      <div class="status-left">
+        <div class="dot" id="status-dot"></div>
+        <span class="status-text" id="status-text">—</span>
+      </div>
+      <span class="status-meta" id="status-meta">—</span>
+    </div>
+  </div>
+ 
+  <!-- Pool + size metrics -->
+  <div>
+    <div class="section-label">Overview</div>
+    <div class="metric-grid" id="overview-grid">
+      <div class="metric">
+        <div class="metric-label">DB size</div>
+        <div class="metric-value accent" id="m-db-size">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Latency</div>
+        <div class="metric-value green" id="m-latency">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Pool total</div>
+        <div class="metric-value" id="m-pool-total">—</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Pool idle</div>
+        <div class="metric-value" id="m-pool-idle">—</div>
+      </div>
+    </div>
+  </div>
+ 
+  <!-- Table row counts -->
+  <div>
+    <div class="section-label">Tables</div>
+    <div class="card">
+      <input type="text" id="rowCount" onkeyup="filterRowCount()" placeholder="Dataset">
+      <div class="card-header">
+        Row counts
+        <span class="badge" id="table-count-badge">—</span>
+      </div>
+      <table>
+        <thead>
+          <tr class="header">
+            <th style="width:30%;">Dataset</th>
+            <th style="width:30%;">Table</th>
+            <th style="width:30%;">Count</th>
+            <th style="width:10%;">Total Size</th>
+          </tr>
+        </thead>
+        <tbody id="table-list">
+          <tr>
+            <td colspan="4">Refresh to load the data</td>   
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+ 
+  <!-- Slow queries -->
+  <div>
+    <div class="section-label">Slow queries</div>
+    <div class="card">
+      <div class="card-header">
+        Top 10 by avg time
+        <span class="badge" id="sq-badge">pg_stat_statements</span>
+      </div>
+      <div id="slow-query-list">
+        <div class="empty">Hit Refresh to load</div>
+      </div>
+    </div>
+  </div>
+ 
+  <!-- Pipeline -->
+  <div>
+    <div class="section-label">Pipeline</div>
+    <div class="card">
+      <div class="card-header">Job status</div>
+      <div class="pipeline-grid" id="pipeline-summary">
+        <div class="p-stat">
+          <div class="p-stat-value muted" id="p-running">—</div>
+          <div class="p-stat-label">running</div>
+        </div>
+        <div class="p-stat">
+          <div class="p-stat-value muted" id="p-completed">—</div>
+          <div class="p-stat-label">completed</div>
+        </div>
+        <div class="p-stat">
+          <div class="p-stat-value muted" id="p-failed">—</div>
+          <div class="p-stat-label">failed 24h</div>
+        </div>
+      </div>
+      <div id="failed-jobs"></div>
+    </div>
+  </div>
+</div>
+ 
+<!-- Config sheet -->
+<div class="config-overlay" id="config-overlay">
+  <div class="config-sheet">
+    <div class="config-handle"></div>
+    <div class="config-title">Settings</div>
+    <div class="config-field">
+      <label>API base URL</label>
+      <input type="text" id="cfg-url" placeholder="http://localhost:3001" />
+    </div>
+    <div class="config-field">
+      <label>API key</label>
+      <input type="password" id="cfg-key" placeholder="your-api-key" autocomplete="off" />
+    </div>
+    <div class="config-actions">
+      <button class="btn" id="cfg-cancel">Cancel</button>
+      <button class="btn primary" id="cfg-save">Save</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
