@@ -6,31 +6,69 @@ const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
+const { url } = require('inspector');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 const API_KEY = process.env.API_KEY || 'change-me-please';
+const CONNECTIONS_FILE = path.join(__dirname, 'connections.json');
 
 app.use(express.static(path.join(__dirname, 'static')));
 
 // ─── DB Connection Pool ───────────────────────────────────────────────────────
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // e.g. DATABASE_URL=postgresql://user:password@host:5432/dbname
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 5000,
-});
+let registry = {};
+
+function loadConnections() {
+  if (!fs.existsSync(CONNECTIONS_FILE)) {
+    if (process.env.DATABASE_URL) {
+      const seed = { default: { label: "Default", url: process.env.DATABASE_URL} };
+      fs.writeFileSync(CONNECTIONS_FILE, JSON.stringify(seed, null, 2));
+    } else {
+      fs.writeFileSync(CONNECTIONS_FILE, JSON.stringify({}, null, 2));
+    }
+  }
+  
+  const saved = JSON.parse(fs.readFileSync(CONNECTIONS_FILE, 'utf8'));
+
+  for (const [name, meta] of Object.entries(saved)) {
+    registry[name] = {
+      label: meta.label,
+      url: meta.url,
+      pool: makePool(meta.url),
+    };
+  }
+
+  console.log('Loaded ${Object.keys(registry).length} connection(s)')
+}
+
+function saveConnections() {
+  const toSave = {};
+  for (const [name, entry] of Object.entries(registry)) {
+    toSave[name] = { label: entry.label, url: entry.url };
+  }
+  fs.writeFileSync(CONNECTIONS_FILE, JSON.stringify(toSave, null, 2));
+}
+
+function makePool(url) {
+  return new Pool({
+    connectionString: url,
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+  });
+}
+
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 app.use(cors());
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'views/index.html'));
-});
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'views/index.html')));
+app.get('/connections', (req, res) => res.sendFile(path.join(__dirname, 'views/connections.html')));
+
 
 // Simple API key auth — checks X-API-Key header on all /api routes
 app.use('/api', (req, res, next) => {
@@ -41,23 +79,123 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// ─── 1. DB Connection Status ─────────────────────────────────────────────────
+// Resolve pool from X-DB-Name header (falls back to first registered DB)
+app.use('/api/stats', resolvePool);
+app.use('/api/status', resolvePool);
+app.use('/api/pipeline', resolvePool);
+app.use('/api/all', resolvePool);
 
-app.get('/api/status', async (req, res) => {
+function resolvePool(req, res, next) {
+  const name = req.headers['x-db-name'];
+  const keys = Object.keys(registry);
+
+  if (!keys.length) {
+    return res.status(503).json({ success: false, error: 'No databases configured. Visit /connections to add one.' });
+  }
+
+  const entry = name && registry[name] ? registry[name] : registry[keys[0]];
+  req.pool = entry.pool;
+  req.dbName = name || keys[0];
+  next();
+}
+
+// ─── Connection Management Endpoints ─────────────────────────────────────────
+
+// List all connections (never expose the URL in full — mask password)
+app.get('/api/connections', (req, res) => {
+  const list = Object.entries(registry).map(([name, entry]) => ({
+    name,
+    label: entry.label,
+    urlPreview: maskUrl(entry.url),
+  }));
+  console.log(list);
+  res.json({ success: true, data: list });
+});
+
+// Add or update a connection
+app.post('/api/connections', async (req, res) => {
+  const { name, label, url } = req.body;
+
+  if (!name || !url) {
+    console.log("name required");
+    return res.status(400).json({ success: false, error: '`name` and `url` are required' });
+  }
+  if (!/^[a-z0-9_-]+$/i.test(name)) {
+    console.log("valid name required");
+    return res.status(400).json({ success: false, error: '`name` must be alphanumeric / hyphens / underscores only' });
+  }
+
+  // Destroy old pool if replacing
+  if (registry[name]) {
+    await registry[name].pool.end().catch(() => {});
+  }
+
+  registry[name] = { label: label || name, url, pool: makePool(url) };
+  saveConnections();
+
+  res.json({ success: true, data: { name, label: label || name } });
+});
+
+// Test a connection without saving
+app.post('/api/connections/test', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ success: false, error: '`url` is required' });
+
+  const testPool = makePool(url);
   const start = Date.now();
   try {
-    await pool.query('SELECT 1');
+    await testPool.query('SELECT 1');
+    res.json({ success: true, latencyMs: Date.now() - start });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  } finally {
+    await testPool.end().catch(() => {});
+  }
+});
+
+// Delete a connection
+app.delete('/api/connections/:name', async (req, res) => {
+  const { name } = req.params;
+  if (!registry[name]) {
+    return res.status(404).json({ success: false, error: 'Connection not found' });
+  }
+  await registry[name].pool.end().catch(() => {});
+  delete registry[name];
+  saveConnections();
+  res.json({ success: true });
+});
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+function maskUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.password) u.password = '****';
+    return u.toString();
+  } catch {
+    return url.replace(/:([^@]+)@/, ':****@');
+  }
+}
+
+// ─── 1. DB Connection Status ─────────────────────────────────────────────────
+
+app.get('/api/status', resolvePool, async (req, res) => {
+  const start = Date.now();
+  try {
+    await req.pool.query('SELECT 1');
     res.json({
       success: true,
       data: {
         connected: true,
+        dbName: req.dbName,
         latencyMs: Date.now() - start,
-        poolTotal: pool.totalCount,
-        poolIdle: pool.idleCount,
-        poolWaiting: pool.waitingCount,
+        poolTotal: req.pool.totalCount,
+        poolIdle: req.pool.idleCount,
+        poolWaiting: req.pool.waitingCount,
       },
     });
   } catch (err) {
+    console.log(err.message);
     res.status(500).json({
       success: false,
       data: { connected: false },
@@ -68,9 +206,9 @@ app.get('/api/status', async (req, res) => {
 
 // ─── 2. Database Size ─────────────────────────────────────────────────────────
 
-app.get('/api/stats/db-size', async (req, res) => {
+app.get('/api/stats/db-size', resolvePool, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const result = await req.pool.query(`
       SELECT
         pg_database.datname                            AS database,
         pg_size_pretty(pg_database_size(pg_database.datname)) AS pretty_size,
@@ -86,11 +224,11 @@ app.get('/api/stats/db-size', async (req, res) => {
 
 // ─── 3. Table Row Counts ──────────────────────────────────────────────────────
 
-app.get('/api/stats/row-counts', async (req, res) => {
+app.get('/api/stats/row-counts', resolvePool, async (req, res) => {
   // Use pg_class estimates for speed; accurate enough for monitoring.
   // Switch to COUNT(*) per table if you need exact numbers (slower).
   try {
-    const result = await pool.query(`
+    const result = await req.pool.query(`
       SELECT
         pn.nspname                    AS dataset_name,
         pc.relname                    AS table_name,
@@ -112,11 +250,11 @@ app.get('/api/stats/row-counts', async (req, res) => {
 // Requires pg_stat_statements extension:
 //   CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
-app.get('/api/stats/slow-queries', async (req, res) => {
+app.get('/api/stats/slow-queries', resolvePool, async (req, res) => {
   const limit = parseInt(req.query.limit) || 10;
   try {
     // Check extension is available first
-    const extCheck = await pool.query(`
+    const extCheck = await req.pool.query(`
       SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
     `);
     if (extCheck.rowCount === 0) {
@@ -126,7 +264,7 @@ app.get('/api/stats/slow-queries', async (req, res) => {
       });
     }
 
-    const result = await pool.query(`
+    const result = await req.pool.query(`
       SELECT
         LEFT(query, 120)              AS query_preview,
         calls,
@@ -149,19 +287,19 @@ app.get('/api/stats/slow-queries', async (req, res) => {
 // ─── 5. Pipeline / Custom Metrics ────────────────────────────────────────────
 // Adapt the queries below to match your pipeline's actual tables/columns.
 
-app.get('/api/pipeline', async (req, res) => {
+app.get('/api/pipeline', resolvePool, async (req, res) => {
   try {
     const [jobsResult, recentResult, failedResult] = await Promise.all([
 
       // Total jobs by status — adjust table/column names to match yours
-      pool.query(`
+      req.pool.query(`
         SELECT status, COUNT(*) AS count
         FROM pipeline_jobs
         GROUP BY status
       `),
 
       // Last 5 completed jobs
-      pool.query(`
+      req.pool.query(`
         SELECT id, name, status, completed_at,
                extract(epoch FROM (completed_at - started_at))::int AS duration_sec
         FROM pipeline_jobs
@@ -171,7 +309,7 @@ app.get('/api/pipeline', async (req, res) => {
       `),
 
       // Any jobs that failed in the last 24 hours
-      pool.query(`
+      req.pool.query(`
         SELECT id, name, error_message, failed_at
         FROM pipeline_jobs
         WHERE status = 'failed'
@@ -189,6 +327,7 @@ app.get('/api/pipeline', async (req, res) => {
       },
     });
   } catch (err) {
+    console.log(err);
     // Return a partial failure so the dashboard still renders other cards
     res.status(500).json({
       success: false,
@@ -200,14 +339,14 @@ app.get('/api/pipeline', async (req, res) => {
 // ─── 6. All Stats in One Shot ─────────────────────────────────────────────────
 // Handy for the dashboard's single "Refresh" button
 
-app.get('/api/all', async (req, res) => {
+app.get('/api/all', resolvePool, async (req, res) => {
   const results = await Promise.allSettled([
-    pool.query('SELECT 1'),                        // connection ping
-    pool.query(`                                   
+    req.pool.query('SELECT 1'),                        // connection ping
+    req.pool.query(`                                   
       SELECT pg_size_pretty(pg_database_size(current_database())) AS pretty_size,
              pg_database_size(current_database()) AS size_bytes
     `),
-    pool.query(`
+    req.pool.query(`
       SELECT relname AS table_name, reltuples::bigint AS estimated_rows,
              pg_size_pretty(pg_total_relation_size(oid)) AS total_size
       FROM pg_class
@@ -232,11 +371,5 @@ app.get('/api/all', async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-pool.connect((err) => {
-  if (err) {
-    console.error('❌  Failed to connect to PostgreSQL:', err.message);
-    process.exit(1);
-  }
-  console.log('✅  Connected to PostgreSQL');
-  app.listen(PORT, () => console.log(`🚀  API running on http://localhost:${PORT}`));
-});
+loadConnections();
+app.listen(PORT, () => console.log(`🚀  API running on http://localhost:${PORT}`));
