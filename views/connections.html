@@ -318,7 +318,7 @@
 <script>
   // ── API Key (persisted in localStorage, prompts once if missing) ───────────
 
-  const LS_KEY = 'db_monitor_api_key';
+  const LS_KEY = 'dbmon_key';
 
   function getApiKey() { return localStorage.getItem('dbmon_key') || ''; }
   function setApiKey(k) { localStorage.setItem('dbmon_key', k); }

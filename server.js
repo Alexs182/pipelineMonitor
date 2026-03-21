@@ -108,7 +108,6 @@ app.get('/api/connections', (req, res) => {
     label: entry.label,
     urlPreview: maskUrl(entry.url),
   }));
-  console.log(list);
   res.json({ success: true, data: list });
 });
 
@@ -117,11 +116,9 @@ app.post('/api/connections', async (req, res) => {
   const { name, label, url } = req.body;
 
   if (!name || !url) {
-    console.log("name required");
     return res.status(400).json({ success: false, error: '`name` and `url` are required' });
   }
   if (!/^[a-z0-9_-]+$/i.test(name)) {
-    console.log("valid name required");
     return res.status(400).json({ success: false, error: '`name` must be alphanumeric / hyphens / underscores only' });
   }
 
@@ -195,7 +192,6 @@ app.get('/api/status', resolvePool, async (req, res) => {
       },
     });
   } catch (err) {
-    console.log(err.message);
     res.status(500).json({
       success: false,
       data: { connected: false },
@@ -327,7 +323,6 @@ app.get('/api/pipeline', resolvePool, async (req, res) => {
       },
     });
   } catch (err) {
-    console.log(err);
     // Return a partial failure so the dashboard still renders other cards
     res.status(500).json({
       success: false,
